@@ -37,6 +37,7 @@ mainmenu=(
     "更改配置"
     "查看配置"
     "删除配置"
+    "出站管理"
     "运行管理"
     "更新"
     "卸载"
@@ -1508,25 +1509,28 @@ is_main_menu() {
         del
         ;;
     5)
+        outbound_manage
+        ;;
+    6)
         ask list is_do_manage "启动 停止 重启"
         manage $REPLY &
         msg "\n管理状态执行: $(_green $is_do_manage)\n"
         ;;
-    6)
+    7)
         is_tmp_list=("更新$is_core_name" "更新脚本")
         [[ $is_caddy ]] && is_tmp_list+=("更新Caddy")
         ask list is_do_update null "\n请选择更新:\n"
         update $REPLY
         ;;
-    7)
+    8)
         uninstall
         ;;
-    8)
+    9)
         msg
         load help.sh
         show_help
         ;;
-    9)
+    10)
         ask list is_do_other "启用BBR 查看日志 测试运行 重装脚本 设置DNS"
         case $REPLY in
         1)
@@ -1548,7 +1552,7 @@ is_main_menu() {
             ;;
         esac
         ;;
-    10)
+    11)
         load help.sh
         about
         ;;
@@ -1717,4 +1721,426 @@ main() {
         fi
         ;;
     esac
+}
+
+# 列出现有outbound配置
+list_outbound() {
+    msg "\n$(_green "当前 Outbound 配置:")\n"
+    
+    # 检查配置文件是否存在
+    if [[ ! -f "$is_config_json" ]]; then
+        msg "$is_err 配置文件不存在: $is_config_json"
+        return 1
+    fi
+    
+    # 读取outbound配置
+    local outbounds
+    outbounds=$(jq -r '.outbounds[] | select(.type != null) | [.tag, .type, (.server // "N/A"), (.server_port // "N/A")] | @tsv' "$is_config_json" 2>/dev/null)
+    
+    if [[ -z "$outbounds" ]]; then
+        msg "未找到任何 outbound 配置。"
+        return 0
+    fi
+    
+    # 显示表头
+    printf "%-3s %-25s %-15s %-20s %-10s\n" "序号" "标签(Tag)" "类型(Type)" "服务器地址" "端口"
+    printf "%-3s %-25s %-15s %-20s %-10s\n" "---" "-------------------------" "---------------" "--------------------" "----------"
+    
+    # 显示outbound信息
+    local index=1
+    while IFS=$'\t' read -r tag type server port; do
+        printf "%-3d %-25s %-15s %-20s %-10s\n" "$index" "$tag" "$type" "$server" "$port"
+        ((index++))
+    done <<< "$outbounds"
+    
+    msg ""
+}
+
+# 出站管理主函数
+outbound_manage() {
+    local outbound_menu=(
+        "添加出站"
+        "删除出站"
+        "查看出站"
+        "为配置添加出站"
+        "返回主菜单"
+    )
+    
+    while true; do
+        msg "\n$(_green "========== 出站管理 ==========")"
+        is_tmp_list=("${outbound_menu[@]}")
+        ask list is_outbound_choice null "\n请选择操作:\n"
+        
+        case $REPLY in
+        1)
+            add_outbound
+            ;;
+        2)
+            del_outbound
+            ;;
+        3)
+            list_outbound
+            pause
+            ;;
+        4)
+            add_outbound_to_config_file
+            ;;
+        5)
+            msg "\n返回主菜单..."
+            break
+            ;;
+        *)
+            msg "$is_err 无效的选择，请重试。"
+            ;;
+        esac
+    done
+}
+
+# 添加出站配置
+add_outbound() {
+    msg "\n$(_green "添加新的 Shadowsocks 出站配置")"
+    msg "请输入 Shadowsocks URL (格式: ss://base64@server:port#tag)"
+    msg "示例: ss://YWVzLTEyOC1nY206d296aGlhaTA=@38.60.109.178:18804#test-server"
+    
+    local ss_url
+    while true; do
+        echo -ne "请输入SS URL: "
+        read ss_url
+        
+        # 检查输入是否为空
+        if [[ -z "$ss_url" ]]; then
+            msg "$is_err 输入不能为空，请重新输入。"
+            continue
+        fi
+        
+        # 基本格式验证
+        if [[ ! "$ss_url" =~ ^ss:// ]]; then
+            msg "$is_err 无效的SS URL格式，必须以 'ss://' 开头。"
+            continue
+        fi
+        
+        # 调用ss-to-singbox.sh验证和解析
+        local parsed_json
+        if parsed_json=$(bash ./ss-to-singbox.sh "$ss_url" 2>/dev/null); then
+            msg "$(_green "SS URL 解析成功！")"
+            
+            # 提取tag信息用于唯一性检查
+            local new_tag
+            new_tag=$(echo "$parsed_json" | jq -r '.tag')
+            
+            # 检查tag是否已存在
+            if check_tag_exists "$new_tag"; then
+                msg "$is_warn 标签 '$new_tag' 已存在。"
+                echo -ne "是否使用自动生成的唯一标签? (y/n): "
+                read confirm
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    new_tag="${new_tag}-$(date +%s)"
+                    parsed_json=$(echo "$parsed_json" | jq --arg tag "$new_tag" '.tag = $tag')
+                    msg "使用新标签: $new_tag"
+                else
+                    msg "操作已取消。"
+                    continue
+                fi
+            fi
+            
+            # 添加到配置文件
+            if add_outbound_to_config "$parsed_json"; then
+                msg "$(_green "出站配置添加成功！")"
+                msg "标签: $new_tag"
+                break
+            else
+                msg "$is_err 添加配置失败，请重试。"
+                continue
+            fi
+        else
+            msg "$is_err SS URL 解析失败，请检查格式是否正确。"
+            msg "正确格式示例: ss://YWVzLTEyOC1nY206d296aGlhaTA=@38.60.109.178:18804#test"
+            continue
+        fi
+    done
+}
+
+# 检查tag是否已存在
+check_tag_exists() {
+    local tag="$1"
+    local existing_tags
+    existing_tags=$(jq -r '.outbounds[].tag' "$is_config_json" 2>/dev/null)
+    echo "$existing_tags" | grep -q "^$tag$"
+}
+
+# 将outbound配置添加到config.json
+add_outbound_to_config() {
+    local outbound_json="$1"
+    
+    # 创建备份
+    if [[ ! $IS_TEST_MODE ]]; then
+        cp "$is_config_json" "${is_config_json}.backup.$(date +%s)" 2>/dev/null
+    fi
+    
+    # 添加新的outbound到配置文件
+    local updated_config
+    updated_config=$(jq --argjson outbound "$outbound_json" '.outbounds += [$outbound]' "$is_config_json" 2>/dev/null)
+    
+    if [[ $? -eq 0 && -n "$updated_config" ]]; then
+        echo "$updated_config" > "$is_config_json"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# 删除出站配置
+del_outbound() {
+    msg "\n$(_green "删除 Outbound 配置")"
+    
+    # 检查配置文件是否存在
+    if [[ ! -f "$is_config_json" ]]; then
+        msg "$is_err 配置文件不存在: $is_config_json"
+        return 1
+    fi
+    
+    # 获取可删除的outbound（排除direct类型）
+    local deletable_outbounds
+    deletable_outbounds=$(jq -r '.outbounds[] | select(.type != "direct") | .tag' "$is_config_json" 2>/dev/null)
+    
+    if [[ -z "$deletable_outbounds" ]]; then
+        msg "没有可删除的 outbound 配置。"
+        return 0
+    fi
+    
+    # 创建选项数组
+    local outbound_array=()
+    while IFS= read -r tag; do
+        [[ -n "$tag" ]] && outbound_array+=("$tag")
+    done <<< "$deletable_outbounds"
+    
+    # 添加取消选项
+    outbound_array+=("取消操作")
+    
+    msg "可删除的 Outbound 配置:"
+    is_tmp_list=("${outbound_array[@]}")
+    ask list is_del_choice null "\n请选择要删除的配置:\n"
+    
+    local selected_index=$((REPLY - 1))
+    
+    # 检查是否选择了取消
+    if [[ $selected_index -eq $((${#outbound_array[@]} - 1)) ]]; then
+        msg "操作已取消。"
+        return 0
+    fi
+    
+    # 检查选择是否有效
+    if [[ $selected_index -ge 0 && $selected_index -lt $((${#outbound_array[@]} - 1)) ]]; then
+        local selected_tag="${outbound_array[$selected_index]}"
+        
+        # 显示要删除的配置信息
+        msg "\n即将删除的配置:"
+        jq -r --arg tag "$selected_tag" '.outbounds[] | select(.tag == $tag) | "标签: \(.tag)\n类型: \(.type)\n服务器: \(.server // "N/A")\n端口: \(.server_port // "N/A")"' "$is_config_json"
+        
+        # 确认删除
+        echo -ne "\n确认删除配置 '$selected_tag'? (y/n): "
+        read confirm
+        
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            if remove_outbound_from_config "$selected_tag"; then
+                msg "$(_green "配置 '$selected_tag' 删除成功！")"
+            else
+                msg "$is_err 删除配置失败。"
+            fi
+        else
+            msg "操作已取消。"
+        fi
+    else
+        msg "$is_err 无效的选择。"
+    fi
+}
+
+# 从config.json中删除指定的outbound
+remove_outbound_from_config() {
+    local tag="$1"
+    
+    # 创建备份
+    if [[ ! $IS_TEST_MODE ]]; then
+        cp "$is_config_json" "${is_config_json}.backup.$(date +%s)" 2>/dev/null
+    fi
+    
+    # 删除指定tag的outbound
+    local updated_config
+    updated_config=$(jq --arg tag "$tag" '.outbounds = [.outbounds[] | select(.tag != $tag)]' "$is_config_json" 2>/dev/null)
+    
+    if [[ $? -eq 0 && -n "$updated_config" ]]; then
+        echo "$updated_config" > "$is_config_json"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# 为配置添加出站
+add_outbound_to_config_file() {
+    msg "\n$(_green "为配置添加出站")"
+    
+    # 选择配置文件
+    msg "\n请选择要添加出站的配置文件:"
+    get file
+    
+    if [[ ! $is_config_file ]]; then
+        msg "$is_err 未选择有效的配置文件。"
+        return 1
+    fi
+    
+    local config_path="$is_conf_dir/$is_config_file"
+    msg "\n选择的配置文件: $(_green "$is_config_file")"
+    
+    # 检查配置文件是否存在
+    if [[ ! -f "$config_path" ]]; then
+        msg "$is_err 配置文件不存在: $config_path"
+        return 1
+    fi
+    
+    # 获取配置文件中现有的出站
+    local config_outbounds
+    config_outbounds=$(get_config_outbounds "$config_path")
+    
+    # 获取可用的出站列表
+    if [[ ! -f "$is_config_json" ]]; then
+        msg "$is_err 主配置文件不存在: $is_config_json"
+        return 1
+    fi
+    
+    local available_outbounds
+    available_outbounds=$(jq -r '.outbounds[] | select(.type != null) | .tag' "$is_config_json" 2>/dev/null)
+    
+    if [[ -z "$available_outbounds" ]]; then
+        msg "没有可用的出站配置。请先使用'添加出站'功能添加出站。"
+        return 0
+    fi
+    
+    # 显示出站列表，标注已添加的
+    msg "\n可用的出站配置 (标记 $(_yellow "[已添加]") 表示该配置已包含此出站):"
+    
+    local outbound_array=()
+    local index=1
+    
+    while IFS= read -r tag; do
+        [[ -n "$tag" ]] && {
+            if echo "$config_outbounds" | grep -q "^$tag$"; then
+                outbound_array+=("$tag [已添加]")
+                printf "%-3d %-30s %s\n" "$index" "$tag" "$(_yellow "[已添加]")"
+            else
+                outbound_array+=("$tag")
+                printf "%-3d %-30s\n" "$index" "$tag"
+            fi
+            ((index++))
+        }
+    done <<< "$available_outbounds"
+    
+    # 添加取消选项
+    outbound_array+=("取消操作")
+    printf "%-3d %-30s\n" "$index" "取消操作"
+    
+    echo -ne "\n请选择要添加的出站 [1-$index]: "
+    read selected_index
+    
+    # 验证输入
+    if [[ ! "$selected_index" =~ ^[0-9]+$ ]] || [[ $selected_index -lt 1 ]] || [[ $selected_index -gt $index ]]; then
+        msg "$is_err 无效的选择。"
+        return 1
+    fi
+    
+    # 检查是否选择了取消
+    if [[ $selected_index -eq $index ]]; then
+        msg "操作已取消。"
+        return 0
+    fi
+    
+    # 获取选择的出站tag（去除已添加标记）
+    local selected_tag="${outbound_array[$((selected_index - 1))]}"
+    selected_tag="${selected_tag% [已添加]}"  # 移除已添加标记
+    
+    # 获取完整的出站配置
+    local outbound_config
+    outbound_config=$(jq --arg tag "$selected_tag" '.outbounds[] | select(.tag == $tag)' "$is_config_json" 2>/dev/null)
+    
+    if [[ -z "$outbound_config" ]]; then
+        msg "$is_err 无法获取出站配置: $selected_tag"
+        return 1
+    fi
+    
+    # 显示出站信息并确认
+    msg "\n即将添加的出站配置:"
+    echo "$outbound_config" | jq -r '"标签: \(.tag)\n类型: \(.type)\n服务器: \(.server // "N/A")\n端口: \(.server_port // "N/A")"'
+    
+    # 检查是否已存在
+    if echo "$config_outbounds" | grep -q "^$selected_tag$"; then
+        msg "\n$(_yellow "注意: 该配置已包含此出站，将会替换现有配置。")"
+    fi
+    
+    echo -ne "\n确认添加出站 '$selected_tag' 到配置 '$is_config_file'? (y/n): "
+    read confirm
+    
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        if update_config_outbound "$config_path" "$outbound_config" "$selected_tag"; then
+            msg "$(_green "出站 '$selected_tag' 已成功添加到配置 '$is_config_file'！")"
+        else
+            msg "$is_err 添加出站失败。"
+        fi
+    else
+        msg "操作已取消。"
+    fi
+}
+
+# 获取配置文件中的出站列表
+get_config_outbounds() {
+    local config_file="$1"
+    
+    if [[ ! -f "$config_file" ]]; then
+        return 1
+    fi
+    
+    # 获取配置文件中的出站tag列表
+    jq -r '.outbounds[]?.tag // empty' "$config_file" 2>/dev/null
+}
+
+# 更新配置文件中的出站
+update_config_outbound() {
+    local config_file="$1"
+    local outbound_config="$2" 
+    local outbound_tag="$3"
+    
+    # 创建备份
+    if [[ ! $IS_TEST_MODE ]]; then
+        cp "$config_file" "${config_file}.backup.$(date +%s)" 2>/dev/null
+    fi
+    
+    # 读取现有配置
+    local current_config
+    current_config=$(cat "$config_file" 2>/dev/null)
+    
+    if [[ -z "$current_config" ]]; then
+        msg "$is_err 无法读取配置文件: $config_file"
+        return 1
+    fi
+    
+    # 检查配置是否有outbounds字段
+    local has_outbounds
+    has_outbounds=$(echo "$current_config" | jq 'has("outbounds")' 2>/dev/null)
+    
+    local updated_config
+    if [[ "$has_outbounds" == "true" ]]; then
+        # 删除同名的出站（如果存在）然后添加新的
+        updated_config=$(echo "$current_config" | jq --arg tag "$outbound_tag" '.outbounds = [.outbounds[] | select(.tag != $tag)]' 2>/dev/null)
+        updated_config=$(echo "$updated_config" | jq --argjson outbound "$outbound_config" '.outbounds += [$outbound]' 2>/dev/null)
+    else
+        # 配置文件没有outbounds字段，添加新的outbounds数组
+        updated_config=$(echo "$current_config" | jq --argjson outbound "$outbound_config" '.outbounds = [$outbound]' 2>/dev/null)
+    fi
+    
+    if [[ $? -eq 0 && -n "$updated_config" ]]; then
+        echo "$updated_config" > "$config_file"
+        return 0
+    else
+        msg "$is_err JSON操作失败"
+        return 1
+    fi
 }
