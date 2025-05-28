@@ -384,7 +384,7 @@ main() {
     if [[ $local_install ]]; then
         cp -rf $PWD/* $is_sh_dir
     else
-        tar zxf $is_sh_ok -C $is_sh_dir
+        tar zxf $is_sh_ok --strip-components 1 -C $is_sh_dir
     fi
 
     # create core bin dir
